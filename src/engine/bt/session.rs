@@ -317,64 +317,54 @@ impl BtSession {
     }
 
     /// 读回整个分片（可能跨文件）。
+    ///
+    /// 关键：每个文件在 torrent 整体数据流里的**起始偏移是前面所有文件长度之和**，
+    /// 而不是当前游标。早期实现把 `f_start` 写成 `cursor`，导致 `inner` 恒为 0 ——
+    /// 所有块都读写文件开头，于是每个分片校验都失败。
     async fn read_piece(&self, piece: u32, buf: &mut [u8]) -> Result<usize> {
+        let start = piece as u64 * self.meta.piece_length as u64;
+        let end = start + self.meta.piece_len(piece as usize) as u64;
         let mut written = 0usize;
-        let mut cursor = piece as u64 * self.meta.piece_length as u64;
-        let end_piece = cursor + self.meta.piece_len(piece as usize) as u64;
 
-        for f in &self.meta.files {
-            if written >= buf.len() || cursor >= end_piece {
+        for (idx, inner, len) in map_span(&self.meta.files, start, end) {
+            let len = len as usize;
+            if written + len > buf.len() {
                 break;
             }
-            let f_start = cursor;
-            let f_end = f_start + f.length;
-            if cursor >= f_end {
-                continue;
-            }
-            let inner = cursor - f_start;
-            let avail = f.length - inner;
-            let want = ((buf.len() - written) as u64).min(avail);
-            let want = want.min(end_piece - cursor) as usize;
-            if want == 0 {
-                break;
-            }
-            let path = self.file_path_for(f);
+            let path = self.file_path_for(&self.meta.files[idx]);
             let mut fh = tokio::fs::File::open(&path).await?;
             {
                 use tokio::io::AsyncSeekExt;
                 fh.seek(std::io::SeekFrom::Start(inner)).await?;
             }
-            let mut tmp = vec![0u8; want];
             {
                 use tokio::io::AsyncReadExt;
-                fh.read_exact(&mut tmp).await?;
+                fh.read_exact(&mut buf[written..written + len]).await?;
             }
-            buf[written..written + want].copy_from_slice(&tmp);
-            written += want;
-            cursor += want as u64;
+            written += len;
         }
         Ok(written)
     }
 
-    /// 写入一个块。
+    /// 写入一个块（可能跨文件）。
     async fn write_block(&self, byte_offset: u64, data: &[u8]) -> Result<()> {
-        let mut cursor = byte_offset;
+        if data.is_empty() {
+            return Ok(());
+        }
         let end = byte_offset + data.len() as u64;
-        let mut slice = data;
+        let mut covered = 0usize; // 块内已写过的字节数
 
-        for f in &self.meta.files {
-            if slice.is_empty() || cursor >= end {
+        for (idx, inner, len) in map_span(&self.meta.files, byte_offset, end) {
+            let take = len as usize;
+            if covered + take > data.len() {
                 break;
             }
-            let f_start = cursor;
-            let f_end = f_start + f.length;
-            if cursor >= f_end {
-                continue;
-            }
-            let inner = cursor - f_start;
-            let avail = (f.length - inner) as usize;
-            let take = avail.min(slice.len());
+            let chunk = &data[covered..covered + take];
+            let f = &self.meta.files[idx];
             let path = self.file_path_for(f);
+            if let Some(dir) = path.parent() {
+                tokio::fs::create_dir_all(dir).await.ok();
+            }
             let mut fh = tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -384,10 +374,12 @@ impl BtSession {
                 use tokio::io::AsyncSeekExt;
                 fh.seek(std::io::SeekFrom::Start(inner)).await?;
             }
-            fh.write_all(&slice[..take]).await?;
+            {
+                use tokio::io::AsyncWriteExt;
+                fh.write_all(chunk).await?;
+            }
             fh.flush().await?;
-            slice = &slice[take..];
-            cursor += take as u64;
+            covered += take;
         }
         Ok(())
     }
@@ -462,13 +454,24 @@ impl BtSession {
         }
         on_progress(self.stats.lock().unwrap().clone());
 
-        // tracker 循环
-        let trackers = super::metainfo::trackers_of(&self.meta);
+        // tracker 循环。
+        // 注意：磁力链拿到的 metainfo 往往**不带** announce，
+        // 只用 `trackers_of` 会得到空列表 → 一次都不公告，只能退化到 DHT。
+        // 这里和磁力链取元数据阶段一样，合并内置默认 tracker 兜底；
+        // 但 private 种子（BEP 27）必须只用种子自带的 tracker。
+        let own = super::metainfo::trackers_of(&self.meta);
+        let trackers = if self.meta.is_private {
+            own
+        } else {
+            merge_trackers(&own)
+        };
         let tracker_task = tokio::spawn(tracker_loop(
             trackers,
             self.meta.info_hash,
             self.opts.port,
             self.opts.max_peers,
+            self.meta.total_length,
+            self.stats.clone(),
             addr_tx.clone(),
             msg.clone(),
         ));
@@ -900,38 +903,84 @@ async fn connect_peer(
 }
 
 /// 周期性向 tracker 公告并把 peer 送入队列。
+///
+/// 几个关键点（都曾经踩过坑）：
+/// - **并发**公告所有 tracker：串行时一个死 tracker 就要等满超时，表现就是"一直连接不上"；
+/// - `event` 只在**第一轮**发 `started`，之后必须发 `none`（重复 started 会被限流甚至拒绝）；
+/// - 带上真实的 `left`/`downloaded`/`uploaded`：`left=0` 等于宣称自己是种子，
+///   部分 tracker 因此不给 peer；
+/// - 失败过的 tracker 进冷却，避免每轮都被它拖住。
 async fn tracker_loop(
     trackers: Vec<String>,
     info_hash: [u8; 20],
     port: u16,
     numwant: usize,
+    total_size: u64,
+    stats: Arc<Mutex<BtStats>>,
     addr_tx: mpsc::UnboundedSender<SocketAddr>,
     msg: Msg,
 ) {
+    /// 单个 tracker 的公告超时（并发后总耗时 ≈ 这个值，而不是 N 倍）
+    const ANNOUNCE_CAP: Duration = Duration::from_secs(12);
+    /// 失败 tracker 的冷却时间
+    const FAIL_COOLDOWN: Duration = Duration::from_secs(300);
+
     let peer_id = super::metainfo::random_peer_id();
     let client = tracker_client().unwrap_or_else(|_| reqwest::Client::new());
     let mut interval = 1800u64;
     // tracker 全部失效时的兜底：DHT 网络（BEP 5）
     let mut dht: Option<dht::Dht> = None;
+    let mut first_round = true;
+    let mut cooldown: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
 
     loop {
-        let mut got_any = false;
-        for t in trackers.iter() {
+        let event: &'static str = if first_round { "started" } else { "none" };
+        first_round = false;
+        let (downloaded, uploaded) = {
+            let s = stats.lock().unwrap();
+            (s.downloaded, s.uploaded)
+        };
+        let left = total_size.saturating_sub(downloaded);
+
+        // 冷却中的 tracker 先跳过；如果一个都不剩就全部重试一遍
+        let now = std::time::Instant::now();
+        let mut batch: Vec<String> = trackers
+            .iter()
+            .filter(|t| cooldown.get(*t).map(|until| *until <= now).unwrap_or(true))
+            .cloned()
+            .collect();
+        if batch.is_empty() {
+            batch = trackers.clone();
+            cooldown.clear();
+        }
+
+        let futs = batch.iter().map(|t| {
+            let t = t.clone();
+            let client = client.clone();
             let p = AnnounceParams {
                 info_hash,
                 peer_id,
                 port,
-                uploaded: 0,
-                downloaded: 0,
-                left: 0,
-                event: "started",
+                uploaded,
+                downloaded,
+                left,
+                event,
                 numwant: numwant as u32,
             };
-            match announce(t, &p, &client).await {
-                Ok(res) => {
-                    let got = res.peers.len();
+            async move {
+                let r = tokio::time::timeout(ANNOUNCE_CAP, announce(&t, &p, &client)).await;
+                (t, r)
+            }
+        });
+
+        let mut got_any = false;
+        for (t, res) in join_all(futs).await {
+            match res {
+                Ok(Ok(r)) => {
+                    let got = r.peers.len();
                     msg(format!("tracker 返回 {got} 个 peer（{t}）"));
-                    for peer in res.peers {
+                    for peer in r.peers {
                         if peer.port > 0 {
                             let _ = addr_tx.send(SocketAddr::new(peer.ip, peer.port));
                         }
@@ -939,10 +988,17 @@ async fn tracker_loop(
                     if got > 0 {
                         got_any = true;
                     }
-                    interval = res.interval.clamp(30, 1800);
-                    break;
+                    interval = r.interval.clamp(30, 1800);
+                    cooldown.remove(&t);
                 }
-                Err(e) => msg(format!("tracker 失败（{t}）：{e}")),
+                Ok(Err(e)) => {
+                    msg(format!("tracker 失败（{t}）：{e}"));
+                    cooldown.insert(t.clone(), std::time::Instant::now() + FAIL_COOLDOWN);
+                }
+                Err(_) => {
+                    msg(format!("tracker 超时（{t}）"));
+                    cooldown.insert(t.clone(), std::time::Instant::now() + FAIL_COOLDOWN);
+                }
             }
         }
 
@@ -979,6 +1035,36 @@ async fn tracker_loop(
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
+}
+
+/// 把 torrent 整体数据流的 `[from, to)` 区间映射到具体文件：
+/// 返回 `(文件下标, 文件内偏移, 段长度)`，按数据流顺序排列。
+///
+/// 每个文件的起始偏移 = **前面所有文件长度之和**。这里曾经写成"当前游标"，
+/// 结果块总是写到文件开头，所有分片校验都会失败。
+pub(crate) fn map_span(files: &[TorrentFile], from: u64, to: u64) -> Vec<(usize, u64, u64)> {
+    let mut out = Vec::new();
+    if to <= from {
+        return out;
+    }
+    let mut base = 0u64;
+    for (i, f) in files.iter().enumerate() {
+        let f_start = base;
+        let f_end = f_start + f.length;
+        base = f_end;
+        if f_end <= from {
+            continue; // 完全在区间之前
+        }
+        if f_start >= to {
+            break; // 区间已覆盖完
+        }
+        let a = from.max(f_start);
+        let b = to.min(f_end);
+        if b > a {
+            out.push((i, a - f_start, b - a));
+        }
+    }
+    out
 }
 
 /// rarest-first 选块：稀有分片优先，同稀有度按序号推进。
@@ -1212,7 +1298,9 @@ async fn announce_all(
                     port,
                     uploaded: 0,
                     downloaded: 0,
-                    left: 0,
+                    // 拿元数据阶段还不知道总大小；写 1 而不是 0：
+                    // left=0 等于宣称自己已完成，部分 tracker 会因此不给 peer
+                    left: 1,
                     event: "started",
                     numwant: 60,
                 };
@@ -1509,6 +1597,54 @@ mod tests {
             is_private: false,
             node: None,
         }
+    }
+
+    fn files(lengths: &[u64]) -> Vec<TorrentFile> {
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(i, len)| TorrentFile {
+                path: vec![format!("f{i}")],
+                length: *len,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn map_span_covers_single_file_at_correct_offset() {
+        // 回归测试：曾经把"文件起始偏移"当成当前游标，
+        // 结果所有块都写到文件开头，分片校验 100% 失败。
+        let fs = files(&[1000]);
+        assert_eq!(map_span(&fs, 0, 100), vec![(0, 0, 100)]);
+        assert_eq!(map_span(&fs, 500, 600), vec![(0, 500, 100)]);
+        assert_eq!(map_span(&fs, 950, 1000), vec![(0, 950, 50)]);
+    }
+
+    #[test]
+    fn map_span_splits_across_files() {
+        // 三个文件：0..300 / 300..800 / 800..1000
+        let fs = files(&[300, 500, 200]);
+        // 跨第 1、2 个文件
+        assert_eq!(
+            map_span(&fs, 250, 350),
+            vec![(0, 250, 50), (1, 0, 50)]
+        );
+        // 横跨全部三个文件
+        assert_eq!(
+            map_span(&fs, 290, 810),
+            vec![(0, 290, 10), (1, 0, 500), (2, 0, 10)]
+        );
+        // 正好落在边界上
+        assert_eq!(map_span(&fs, 300, 800), vec![(1, 0, 500)]);
+        // 尾部
+        assert_eq!(map_span(&fs, 900, 1000), vec![(2, 100, 100)]);
+    }
+
+    #[test]
+    fn map_span_ignores_out_of_range() {
+        let fs = files(&[100, 100]);
+        assert!(map_span(&fs, 200, 300).is_empty());
+        assert!(map_span(&fs, 50, 50).is_empty());
     }
 
     #[test]

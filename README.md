@@ -37,6 +37,12 @@ Rust 编写的多协议桌面下载工具，支持 **HTTP/HTTPS**、**FTP**、**
 - **DHT**（BEP 5）：KRPC `ping` / `find_node` / `get_peers`，迭代式查找。  
   magnet 自带的 tracker 十有八九已失效，DHT 是找到 peer 的**主要**途径
 - **Tracker**：HTTP(S)（BEP 3 / BEP 23 compact）+ UDP（BEP 15，带超时重传）
+  - **并发**公告所有 tracker（串行时一个死 tracker 就要等满超时）
+  - 同一域名的多个地址**并发竞速**，取最先响应的那个
+  - `event` 只在首轮发 `started`，之后发 `none`；周期性公告不带 `event=`
+  - 带上真实的 `left`/`downloaded`/`uploaded`（`left=0` 等于宣称自己做种，部分 tracker 因此不给 peer）
+  - 连续失败的 tracker 进入 5 分钟冷却，不再每轮拖后腿
+  - 内置默认 tracker 列表按**实测**筛过，只保留能返回 peer 的
 - **Peer wire protocol**：握手（含 BEP 10 扩展位）、bitfield、have、
   request/piece/cancel、choke/unchoke
 - 16 KiB 分块调度，**rarest-first** 策略
@@ -52,6 +58,12 @@ Rust 编写的多协议桌面下载工具，支持 **HTTP/HTTPS**、**FTP**、**
 界面/日志会逐步打印 tracker 与 DHT 的结果。也可以用自带的命令行工具单独验证：
 
 ```bash
+# 单独探测一批 tracker 能否公告成功（并发，按耗时排序，打印每个的 peer 数与失败原因）
+cargo run --example tracker_probe -- <40 位十六进制 info hash> [tracker_url ...]
+
+# 真正跑一次下载若干秒，打印 peer 数 / 已下载 / 分片校验情况后自动取消
+cargo run --example bt_smoke -- "magnet:?xt=urn:btih:..." 60
+
 # 只跑元数据获取，打印每一步（tracker / DHT / ut_metadata）
 cargo run --example meta_fetch -- "magnet:?xt=urn:btih:..."
 
@@ -68,6 +80,9 @@ cargo run --example meta_debug -- <ip:port> <40 位十六进制 info hash>
 - tracker 与 DHT 都是 0 → 种子已无人做种，或本机 **UDP 被防火墙/NAT 阻断**
   （DHT 与 UDP tracker 都依赖 UDP 出站）
 - 有 peer 但元数据超时 → 对端不支持 ut_metadata，换一批 peer 即可
+- 有 peer、也连上了，但**进度一直是 0%、日志刷"分片校验失败"** → 落盘偏移算错
+  （历史上就是 `write_block` 把"文件起始偏移"写成了当前游标，所有块都写到文件开头）。
+  这类问题用 `bt_smoke` 最直观：正常应看到"分片校验通过 1/N"逐条递增
 
 ### 剪贴板监听
 
@@ -169,7 +184,7 @@ cargo build --release
 cargo test
 ```
 
-内置 **82 个测试**（77 单元 + 5 集成）：
+内置 **89 个测试**（84 单元 + 5 集成）：
 
 - 单元测试：bencode 编解码、torrent 解析、magnet 解析（`+` 空格、  
   base32 内嵌元数据、btmh v2 hash、`x.pe`）、info hash hex/base32 解码、  

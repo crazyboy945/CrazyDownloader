@@ -16,17 +16,22 @@ const UDP_TIMEOUT: Duration = Duration::from_secs(4);
 const UDP_TRIES: usize = 3;
 
 /// 默认 tracker：magnet 链接没带 tracker 或 tracker 全挂时的兜底。
+///
+/// 这份列表是**实测**筛过的（2026-10）：用公网 infohash 逐个公告，
+/// 只保留能返回 peer 的。像 `tracker.openbittorrent.com`（已停服）、
+/// `tracker.moeking.me`（DNS 失效）、`bt4g`/`vps02`（返回 502）这些
+/// 只会让首轮公告白等超时，全部剔除。
 pub const DEFAULT_TRACKERS: &[&str] = &[
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.demonii.com:1337/announce",
     "udp://open.stealth.si:80/announce",
-    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://tracker.opentrackr.org:1337/announce",
     "udp://exodus.desync.com:6969/announce",
     "udp://tracker.torrent.eu.org:451/announce",
-    "udp://tracker.moeking.me:6969/announce",
-    "https://tracker.tamersunion.org:443/announce",
-    "http://tracker.bt4g.com:2095/announce",
-    "http://vps02.net.orel.ru:80/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.filemail.com:6969/announce",
 ];
 
 /// 构造带超时与 User-Agent 的 tracker HTTP 客户端。
@@ -112,17 +117,21 @@ async fn announce_http(
 /// 注意：每个参数之间都必须有 `&`，否则 `peer_id` 之后的参数会被并进上一个值里
 /// （曾经的 bug：URL 变成 `...peer_id=XXXport=6881uploaded=0...`，tracker 直接拒绝）。
 pub fn build_http_url(tracker_url: &str, p: &AnnounceParams) -> String {
-    let params = [
+    let mut params = vec![
         format!("info_hash={}", percent_encode(&p.info_hash)),
         format!("peer_id={}", percent_encode(&p.peer_id)),
         format!("port={}", p.port),
         format!("uploaded={}", p.uploaded),
         format!("downloaded={}", p.downloaded),
         format!("left={}", p.left),
-        format!("event={}", p.event),
         format!("numwant={}", p.numwant),
         "compact=1".to_string(),
     ];
+    // event 只有 started/completed/stopped 三种合法值；
+    // 周期性公告必须**不带** event（写成 event=none 会被部分 tracker 判为非法）
+    if !matches!(p.event, "" | "none") {
+        params.push(format!("event={}", p.event));
+    }
     let sep = if tracker_url.contains('?') { '&' } else { '?' };
     format!("{tracker_url}{sep}{}", params.join("&"))
 }
@@ -184,6 +193,67 @@ pub fn parse_http_response(body: &[u8]) -> Result<AnnounceResult> {
     })
 }
 
+/// UDP tracker 协议魔数（BEP 15 规定的 protocol_id）。
+const UDP_PROTOCOL_ID: u64 = 0x0000_0417_2710_1980;
+/// connect 请求里 action 固定为 0，announce 固定为 1。
+const UDP_ACTION_CONNECT: u32 = 0;
+const UDP_ACTION_ANNOUNCE: u32 = 1;
+
+/// 构造 connect 请求（16 字节）。
+///
+/// ```text
+/// offset 0  : protocol_id (8)
+/// offset 8  : action = 0 (4)
+/// offset 12 : transaction_id (4)
+/// ```
+///
+/// 早期实现漏掉了 action 字段，包只有 12 字节，tracker 把 action 解析成
+/// transaction_id 后直接丢弃 —— 表现就是"所有 udp tracker 都连不上"。
+pub fn connect_request(transaction_id: u32) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&UDP_PROTOCOL_ID.to_be_bytes());
+    buf[8..12].copy_from_slice(&UDP_ACTION_CONNECT.to_be_bytes());
+    buf[12..16].copy_from_slice(&transaction_id.to_be_bytes());
+    buf
+}
+
+/// event 取值：BEP 15 里 completed=1、started=2、stopped=3（和 HTTP 的字符串顺序相反）。
+fn event_code(event: &str) -> u32 {
+    match event {
+        "completed" => 1,
+        "started" => 2,
+        "stopped" => 3,
+        _ => 0,
+    }
+}
+
+/// 构造 announce 请求（98 字节）。
+///
+/// ```text
+/// 0   connection_id (8)      16  info_hash (20)      56  downloaded (8)
+/// 8   action = 1    (4)      36  peer_id   (20)      64  left       (8)
+/// 12  transaction_id(4)      76  uploaded  (8)       84  event      (4)
+/// 88  ip (4)   92 key (4)    96  num_want (4)        100 port (2)
+/// ```
+pub fn announce_request(connection_id: u64, transaction_id: u32, p: &AnnounceParams) -> [u8; 98] {
+    let mut buf = [0u8; 98];
+    buf[0..8].copy_from_slice(&connection_id.to_be_bytes());
+    buf[8..12].copy_from_slice(&UDP_ACTION_ANNOUNCE.to_be_bytes());
+    buf[12..16].copy_from_slice(&transaction_id.to_be_bytes());
+    buf[16..36].copy_from_slice(&p.info_hash);
+    buf[36..56].copy_from_slice(&p.peer_id);
+    buf[56..64].copy_from_slice(&p.downloaded.to_be_bytes());
+    buf[64..72].copy_from_slice(&p.left.to_be_bytes());
+    buf[72..80].copy_from_slice(&p.uploaded.to_be_bytes());
+    buf[80..84].copy_from_slice(&event_code(p.event).to_be_bytes());
+    // 84..88 是 IP 地址，0 表示"由 tracker 根据数据包源地址判断"
+    // key 用于跨 IP 变化识别同一个客户端，随机一个即可
+    buf[88..92].copy_from_slice(&rand::random::<u32>().to_be_bytes());
+    buf[92..96].copy_from_slice(&(-1i32).to_be_bytes()); // num_want = -1
+    buf[96..98].copy_from_slice(&p.port.to_be_bytes());
+    buf
+}
+
 /// UDP tracker（BEP 15）：connect + announce 两步握手。
 pub async fn announce_udp(tracker_url: &str, p: &AnnounceParams) -> Result<AnnounceResult> {
     // "udp://" 是 6 个字符；曾经写成 `get(..7)`，导致所有 udp tracker 都被判为非法地址
@@ -195,12 +265,29 @@ pub async fn announce_udp(tracker_url: &str, p: &AnnounceParams) -> Result<Annou
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/announce"),
     };
-    let addr: std::net::SocketAddr = tokio::net::lookup_host(hostport)
+    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(hostport)
         .await
-        .context("解析 tracker 地址失败")?
-        .next()
-        .context("tracker 无可用地址")?;
+        .with_context(|| format!("解析 tracker 地址失败：{hostport}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("tracker 域名没有可用地址：{hostport}");
+    }
+    // 多 A 记录的 tracker 很常见，其中总有一两个地址不通。
+    // 串行试会白等一整轮超时（4s×重试），这里让所有地址并发竞速，取最先成功的。
+    addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+    let futs: Vec<_> = addrs
+        .into_iter()
+        .map(|addr| Box::pin(announce_udp_addr(addr, p)))
+        .collect();
+    // select_ok：第一个成功就返回；全部失败才报错
+    match futures_util::future::select_ok(futs).await {
+        Ok((res, _rest)) => Ok(res),
+        Err(e) => Err(e),
+    }
+}
 
+/// 向单个地址完成 connect + announce。
+async fn announce_udp_addr(addr: std::net::SocketAddr, p: &AnnounceParams) -> Result<AnnounceResult> {
     let bind: std::net::SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -209,47 +296,21 @@ pub async fn announce_udp(tracker_url: &str, p: &AnnounceParams) -> Result<Annou
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(addr).await?;
 
-    // Step 1: connect request，protocol_id = 0x41727101980
-    let transaction_id: u32 = rand::random();
-    let mut req = Vec::with_capacity(16);
-    req.extend_from_slice(&0x4172_7101_980i64.to_be_bytes());
-    req.extend_from_slice(&transaction_id.to_be_bytes());
-
-    let buf = udp_transaction(&sock, &req, transaction_id).await?;
-    // udp_transaction 已校验 transaction_id，这里再确认 action=0（connect），
-    // 避免把其它响应当成 conn_id
+    // Step 1: connect
+    let tid: u32 = rand::random();
+    let buf = udp_transaction(&sock, &connect_request(tid), tid).await?;
     let action = i32::from_be_bytes(buf[0..4].try_into().unwrap());
     if action != 0 {
         bail!(
-            "UDP tracker connect 响应异常：action={}（tracker {hostport} 可能不是 UDP tracker）",
+            "connect 响应 action={}（期望 0，{addr} 可能不是 UDP tracker）",
             action
         );
     }
-    let conn_id = i64::from_be_bytes(buf[8..16].try_into().unwrap());
+    let conn_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
 
-    // Step 2: announce request
-    let announce_tid: u32 = rand::random();
-    let mut req = Vec::with_capacity(98);
-    req.extend_from_slice(&conn_id.to_be_bytes());
-    req.extend_from_slice(&announce_tid.to_be_bytes());
-    req.extend_from_slice(&p.info_hash);
-    req.extend_from_slice(&p.peer_id);
-    req.extend_from_slice(&p.downloaded.to_be_bytes());
-    req.extend_from_slice(&p.left.to_be_bytes());
-    req.extend_from_slice(&p.uploaded.to_be_bytes());
-    req.extend_from_slice(&match p.event {
-        "completed" => 2u32,
-        "started" => 1u32,
-        "stopped" => 3u32,
-        _ => 0u32,
-    }
-    .to_be_bytes());
-    req.extend_from_slice(&0u32.to_be_bytes()); // IP
-    req.extend_from_slice(&0u32.to_be_bytes()); // key
-    req.extend_from_slice(&(-1i32).to_be_bytes()); // num_want: 尽可能多
-    req.extend_from_slice(&p.port.to_be_bytes());
-
-    let resp = udp_transaction(&sock, &req, announce_tid).await?;
+    // Step 2: announce
+    let tid2: u32 = rand::random();
+    let resp = udp_transaction(&sock, &announce_request(conn_id, tid2, p), tid2).await?;
     parse_udp_response(&resp)
 }
 
@@ -442,6 +503,91 @@ mod tests {
     #[test]
     fn rejects_short_udp_response() {
         assert!(parse_udp_response(&[0u8, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn udp_connect_packet_matches_bep15() {
+        // 回归测试：曾经漏掉 action 字段（只有 12 字节），tracker 会把
+        // transaction_id 当成 action 然后丢弃整个包 → 所有 udp tracker 都连不上。
+        let buf = connect_request(0x1234_5678);
+        assert_eq!(buf.len(), 16, "connect 请求必须是 16 字节");
+        assert_eq!(
+            u64::from_be_bytes(buf[0..8].try_into().unwrap()),
+            0x0000_0417_2710_1980,
+            "protocol_id 不对"
+        );
+        assert_eq!(
+            u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+            0,
+            "action 必须是 0（connect）"
+        );
+        assert_eq!(
+            u32::from_be_bytes(buf[12..16].try_into().unwrap()),
+            0x1234_5678,
+            "transaction_id 位置不对"
+        );
+    }
+
+    #[test]
+    fn udp_announce_packet_matches_bep15() {
+        let p = AnnounceParams {
+            info_hash: [0xAAu8; 20],
+            peer_id: [0xBBu8; 20],
+            port: 51413,
+            uploaded: 1,
+            downloaded: 2,
+            left: 3,
+            event: "started",
+            numwant: 50,
+        };
+        let buf = announce_request(0xDEAD_BEEF_1234_5678, 0x99, &p);
+        assert_eq!(buf.len(), 98, "announce 请求必须是 98 字节");
+        assert_eq!(
+            u64::from_be_bytes(buf[0..8].try_into().unwrap()),
+            0xDEAD_BEEF_1234_5678
+        );
+        assert_eq!(
+            u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+            1,
+            "action 必须是 1（announce）"
+        );
+        assert_eq!(u32::from_be_bytes(buf[12..16].try_into().unwrap()), 0x99);
+        assert_eq!(&buf[16..36], &[0xAAu8; 20], "info_hash 位置不对");
+        assert_eq!(&buf[36..56], &[0xBBu8; 20], "peer_id 位置不对");
+        assert_eq!(u64::from_be_bytes(buf[56..64].try_into().unwrap()), 2);
+        assert_eq!(u64::from_be_bytes(buf[64..72].try_into().unwrap()), 3);
+        assert_eq!(u64::from_be_bytes(buf[72..80].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_be_bytes(buf[80..84].try_into().unwrap()),
+            2,
+            "started 的 event 码是 2（BEP 15）"
+        );
+        assert_eq!(u16::from_be_bytes(buf[96..98].try_into().unwrap()), 51413);
+    }
+
+    #[test]
+    fn udp_event_codes_follow_bep15() {
+        // BEP 15：completed=1、started=2、stopped=3，与 HTTP 的字符串顺序相反
+        assert_eq!(event_code("completed"), 1);
+        assert_eq!(event_code("started"), 2);
+        assert_eq!(event_code("stopped"), 3);
+        assert_eq!(event_code("none"), 0);
+    }
+
+    #[test]
+    fn periodic_announce_omits_event() {
+        let p = AnnounceParams {
+            info_hash: [0u8; 20],
+            peer_id: [1u8; 20],
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: "none",
+            numwant: 50,
+        };
+        let url = build_http_url("http://tr/announce", &p);
+        assert!(!url.contains("event="), "周期性公告不应带 event：{url}");
     }
 
     #[test]
