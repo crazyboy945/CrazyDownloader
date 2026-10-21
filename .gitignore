@@ -1,0 +1,24 @@
+# 构建产物
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.lib
+
+# 运行期产物
+*.part
+*.part.meta
+*.torrent.part
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地截图与临时文件
+/scripts/out/
+*.png
+!docs/**/*.png

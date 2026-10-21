@@ -1,0 +1,63 @@
+[package]
+name = "rust-dm"
+version = "0.1.0"
+edition = "2021"
+description = "Rust 编写的多协议下载工具，支持 HTTP/HTTPS、FTP、BitTorrent（magnet + torrent）"
+license = "MIT"
+default-run = "rust-dm"
+
+[dependencies]
+# GUI：eframe 提供窗口与渲染，egui 为即时模式界面
+eframe = "0.31"
+egui = "0.31"
+
+# 异步运行时
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "io-std",
+    "net",
+    "sync",
+    "time",
+] }
+
+# HTTP/HTTPS（Windows 下走系统 schannel，无需 OpenSSL）
+reqwest = { version = "0.12", features = ["stream", "http2", "charset"] }
+futures-util = "0.3"
+
+# FTP（被动模式 / REST 续传）
+suppaftp = "12"
+
+# BitTorrent piece 校验
+sha1 = "0.10"
+hex = "0.4"
+
+anyhow = "1"
+walkdir = "2"
+
+# UDP tracker 的 transaction_id 需要随机数
+rand = "0.8"
+
+# Windows / macOS：rfd 的平台后端是内置的，关掉默认特性可以避免拖入
+# xdg-portal / async-std 这一大坨 Linux 专用依赖。
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
+
+# 其他平台走默认特性（Linux 需要 xdg-portal 后端）
+[target.'cfg(not(windows))'.dependencies]
+rfd = "0.15"
+
+[dev-dependencies]
+# 仅用于测试：验证所选字体确实含 CJK 字形（与 egui 底层 ab_glyph 用的是同一个解析器）
+ttf-parser = "0.25"
+
+[profile.release]
+opt-level = 3
+# thin LTO 已能拿到绝大部分优化收益；codegen-units 保留多路并行，
+# 否则最终链接会退化成单线程编译全部依赖（本机实测超过 1 小时仍未完成）。
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
