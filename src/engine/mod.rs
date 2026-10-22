@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tokio::runtime::Runtime;
 
 use crate::common::limits::TokenBucket;
@@ -71,6 +71,56 @@ impl TaskControl {
         let u = meters.1.smooth(up);
         (d, u)
     }
+}
+
+/// 下载收尾：把 `.part` 重命名为正式文件。
+///
+/// 这里是"下载到 100% 却报失败"的高发点：
+/// - **Windows 的 rename 经常因为文件被临时占用而失败** —— 杀毒软件扫描刚写完的
+///   文件、资源管理器的缩略图预览、还有别的程序正打开着它。这类占用通常只持续
+///   几百毫秒，重试几次就能成功；
+/// - 目标路径是个目录时，rename 必然失败，要给出人能看懂的提示；
+/// - 顺手校验一下大小，避免把被截断的文件当成品交出去。
+pub(crate) fn finalize_file(part: &Path, target: &Path, expected: Option<u64>) -> Result<()> {
+    if target.is_dir() {
+        bail!(
+            "目标路径 {} 是一个目录，无法写入文件",
+            target.display()
+        );
+    }
+    if !part.exists() {
+        bail!("临时文件 {} 不存在，下载结果丢失", part.display());
+    }
+    if let Some(exp) = expected {
+        if exp > 0 {
+            let got = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+            if got != exp {
+                bail!("文件大小不符：应为 {exp} 字节，实际 {got} 字节");
+            }
+        }
+    }
+
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..10 {
+        match std::fs::rename(part, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // 目标已存在（且不是目录）时先删掉再试
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(target);
+                }
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    100 * (attempt as u64 + 1),
+                ));
+            }
+        }
+    }
+    let detail = last.map(|e| e.to_string()).unwrap_or_default();
+    bail!(
+        "重命名到 {} 失败：{detail}（目标文件可能正被其它程序占用，关闭后重试即可）",
+        target.display()
+    );
 }
 
 /// 引擎内部共享状态。
@@ -655,36 +705,50 @@ async fn run_bt(
 ///
 /// 必须通过引擎自建的运行时启动：调用时（`main` 里）还没有任何
 /// tokio runtime 上下文，直接 `tokio::spawn` 会 panic。
+///
+/// 注意：Runtime 一定要活到进程结束。之前写成
+/// `let runtime = Runtime::new(); runtime.spawn(...);`——函数一返回
+/// runtime 就被 drop，刚生成的 ticker 任务直接被取消，
+/// 结果 HTTP/FTP 的速度永远显示 0 B/s。
 pub fn spawn_ticker(engine: Arc<Mutex<EngineState>>) {
-    let runtime = Runtime::new().expect("创建 ticker 运行时失败");
-    runtime.spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
-        loop {
-            interval.tick().await;
-            let snapshot: Vec<(Arc<Mutex<Task>>, Option<Arc<TaskControl>>)> = {
-                let s = engine.lock().unwrap();
-                s.tasks
-                    .iter()
-                    .map(|t| {
-                        let id = t.lock().map(|t| t.id).unwrap_or(0);
-                        (t.clone(), s.controls.get(&id).cloned())
-                    })
-                    .collect()
-            };
-            for (t, c) in snapshot {
-                if let (Ok(mut task), Some(ctl)) = (t.lock(), c) {
-                    // BT 的速度由会话按**块**级采样后自己上报（分片级差分在慢速种子上
-                    // 十几秒才动一次，界面会一直显示 0 B/s），这里不要覆盖它。
-                    if task.pieces_total == 0 {
-                        let (down, up) = ctl.compute_speed(task.downloaded, task.uploaded);
-                        task.speed_down = down;
-                        task.speed_up = up;
+    std::thread::Builder::new()
+        .name("rust-dm-ticker".into())
+        .spawn(move || {
+            let runtime = Runtime::new().expect("创建 ticker 运行时失败");
+            runtime.block_on(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                loop {
+                    interval.tick().await;
+                    let snapshot: Vec<(Arc<Mutex<Task>>, Option<Arc<TaskControl>>)> = {
+                        let s = engine.lock().unwrap();
+                        s.tasks
+                            .iter()
+                            .map(|t| {
+                                let id = t.lock().map(|t| t.id).unwrap_or(0);
+                                (t.clone(), s.controls.get(&id).cloned())
+                            })
+                            .collect()
+                    };
+                    for (t, c) in snapshot {
+                        if let (Ok(mut task), Some(ctl)) = (t.lock(), c) {
+                            // BT 的速度由会话按**块**级采样后自己上报（分片级差分在慢速种子上
+                            // 十几秒才动一次，界面会一直显示 0 B/s），这里不要覆盖它。
+                            if task.pieces_total == 0 {
+                                let (down, up) = ctl.compute_speed(task.downloaded, task.uploaded);
+                                task.speed_down = down;
+                                task.speed_up = up;
+                            }
+                            task.eta = estimate_eta(
+                                task.downloaded,
+                                task.total_bytes,
+                                task.speed_down,
+                            );
+                        }
                     }
-                    task.eta = estimate_eta(task.downloaded, task.total_bytes, task.speed_down);
                 }
-            }
-        }
-    });
+            });
+        })
+        .expect("启动 ticker 线程失败");
 }
 
 /// 确保目录存在。

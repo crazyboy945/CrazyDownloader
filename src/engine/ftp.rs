@@ -245,8 +245,7 @@ fn try_download_file(
         .map_err(|e| anyhow!("获取文件大小失败：{e}"))? as u64;
 
     if total > 0 && offset >= total {
-        std::fs::rename(part, local)
-            .with_context(|| format!("重命名到 {} 失败", local.display()))?;
+        crate::engine::finalize_file(part, local, Some(total))?;
         hook(total, total);
         return Ok(());
     }
@@ -304,8 +303,7 @@ fn try_download_file(
         })
         .map_err(|e| anyhow!("下载失败：{e}"))?;
 
-    std::fs::rename(part, local)
-        .with_context(|| format!("重命名到 {} 失败", local.display()))?;
+    crate::engine::finalize_file(part, local, if total > 0 { Some(total) } else { None })?;
     hook(written, total);
     Ok(())
 }

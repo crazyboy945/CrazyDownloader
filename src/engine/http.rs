@@ -203,10 +203,22 @@ impl HttpDownloader {
             return Err(e);
         }
 
+        // 先把"已全部完成"写进续传元数据，再改名：
+        // 如果改名失败（Windows 上文件被杀毒/其它程序临时占用很常见），
+        // 下次重试时能直接从这里续传，而不是从头再下。
+        if total > 0 {
+            let snapshot = shared_ranges.lock().map(|g| g.clone()).unwrap_or_default();
+            write_resume_ranges(target, total, &snapshot);
+        }
+
         // 完成后把 .part 重命名为正式文件，并清理续传元数据
-        tokio::fs::rename(&part_path, target)
-            .await
-            .with_context(|| format!("重命名到 {} 失败", target.display()))?;
+        // （收尾单独抽成 finalize_file：Windows 上文件被临时占用时 rename 会失败，
+        //  重试几次即可，否则就会出现"下到 100% 却报下载失败"）
+        crate::engine::finalize_file(
+            &part_path,
+            target,
+            if total > 0 { Some(total) } else { None },
+        )?;
         clear_resume_file(target);
         Ok(())
     }

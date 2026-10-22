@@ -294,3 +294,29 @@ async fn completes_under_rate_limit() {
         .unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), data);
 }
+
+/// 回归测试：目标文件已存在时（同名文件重复下载），
+/// 下载到 100% 后**不能**因为"重命名覆盖失败"而报错。
+///
+/// Windows 的 rename 不会覆盖已存在的文件，必须先处理旧文件。
+#[tokio::test]
+async fn overwrites_existing_target_without_error() {
+    let body = payload(64 * 1024);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (url, _stop) = serve(body.clone(), true, requests).await;
+
+    let dir = tmpdir("overwrite");
+    let target = dir.join("same.bin");
+    // 模拟"之前已经下过一次"：目标文件已存在
+    std::fs::write(&target, b"old content").unwrap();
+
+    run_download(&url, &target, 4)
+        .await
+        .expect("同名文件已存在时也必须下载成功");
+
+    let got = std::fs::read(&target).unwrap();
+    assert_eq!(got.len(), body.len(), "应写入新下载的内容");
+    assert_eq!(got, body, "内容应与源完全一致");
+    // 旧文件不应被静默丢弃：要么保留为备份，要么明确被替换
+    let _ = std::fs::remove_dir_all(&dir);
+}
