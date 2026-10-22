@@ -147,6 +147,104 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// 速度平滑器（指数加权平均）。
+///
+/// 直接用"本采样窗口的字节差 / 窗口长度"算速度，界面会忽高忽低：
+/// 数据是成块到达的，窗口里没数据就是 0，有数据就冲高。
+/// 这里用 EWMA 平滑：新样本占 35%，其余按历史衰减，
+/// 于是速度是"缓升缓降"的连续曲线，而不是锯齿。
+pub struct SpeedMeter {
+    /// 平滑后的速度（字节/秒）
+    ema: f64,
+    /// 上一次采样时的累计字节数
+    last_bytes: Option<u64>,
+    /// 上一次采样的时刻
+    last_at: Option<std::time::Instant>,
+    /// 采样权重：越大越跟手，越小越平滑
+    alpha: f64,
+    /// 连续多少次"没有新数据"后就把速度衰减到 0
+    idle_ticks: u32,
+}
+
+impl Default for SpeedMeter {
+    fn default() -> Self {
+        Self::new(0.35)
+    }
+}
+
+impl SpeedMeter {
+    /// `alpha` 建议 0.2~0.5：0.2 更平滑，0.5 更跟手。
+    pub fn new(alpha: f64) -> Self {
+        Self {
+            ema: 0.0,
+            last_bytes: None,
+            last_at: None,
+            alpha: alpha.clamp(0.05, 1.0),
+            idle_ticks: 0,
+        }
+    }
+
+    /// 用累计字节数采样一次，返回平滑后的速度（字节/秒）。
+    pub fn sample(&mut self, total_bytes: u64) -> u64 {
+        let now = std::time::Instant::now();
+        let (instant, dt) = match (self.last_bytes, self.last_at) {
+            (Some(prev), Some(t)) => {
+                let dt = now.duration_since(t).as_secs_f64();
+                let delta = total_bytes.saturating_sub(prev) as f64;
+                (delta / dt.max(0.001), dt)
+            }
+            _ => (0.0, 0.0),
+        };
+        self.last_bytes = Some(total_bytes);
+        self.last_at = Some(now);
+
+        // 长时间没有新数据：把速度平滑地降到 0，而不是让它在 0 和峰值之间跳
+        if instant <= 0.0 {
+            self.idle_ticks += 1;
+        } else {
+            self.idle_ticks = 0;
+        }
+        if self.idle_ticks > 3 {
+            // 长时间没数据：按 0.4 逐步衰减到 0，而不是让曲线掉到 0 再冲高
+            self.ema *= 0.4;
+        } else {
+            self.ema = self.alpha * instant + (1.0 - self.alpha) * self.ema;
+        }
+        if self.ema < 1024.0 {
+            0
+        } else {
+            self.ema as u64
+        }
+    }
+
+    /// 直接喂入一个瞬时速度（已经是字节/秒），同样做平滑。
+    pub fn smooth(&mut self, instant: f64) -> u64 {
+        if instant <= 0.0 {
+            self.idle_ticks += 1;
+            if self.idle_ticks > 3 {
+                self.ema *= 0.4;
+            }
+        } else {
+            self.idle_ticks = 0;
+            self.ema = self.alpha * instant + (1.0 - self.alpha) * self.ema;
+        }
+        if self.ema < 1024.0 {
+            0
+        } else {
+            self.ema as u64
+        }
+    }
+
+    /// 当前平滑速度。
+    pub fn value(&self) -> u64 {
+        if self.ema < 1.0 {
+            0
+        } else {
+            self.ema as u64
+        }
+    }
+}
+
 /// 极简百分号解码，用于处理 URL 中的 `%20` 之类转义。
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -218,6 +316,50 @@ pub fn filename_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_meter_smooths_bursty_input() {
+        // 模拟"数据成块到达"：一会儿 1 MB/s，一会儿 0
+        let mut m = SpeedMeter::new(0.35);
+        let burst = m.smooth(1_000_000.0);
+        assert!(burst > 0 && burst < 1_000_000, "首个样本应被平滑：{burst}");
+
+        // 连续几帧没有数据时，速度应缓慢衰减，而不是直接掉到 0
+        let mut v = burst;
+        for _ in 0..2 {
+            v = m.smooth(0.0);
+            assert!(v > 0, "不应立刻归零：{v}");
+        }
+        // 长时间空闲后才归零
+        for _ in 0..8 {
+            v = m.smooth(0.0);
+        }
+        assert_eq!(v, 0, "长期无数据后应归零");
+    }
+
+    #[test]
+    fn speed_meter_converges_to_constant_rate() {
+        let mut m = SpeedMeter::new(0.5);
+        let mut last = 0u64;
+        for _ in 0..40 {
+            last = m.smooth(800_000.0);
+        }
+        // 收敛到 800 KB/s 附近
+        assert!(
+            (700_000..900_000).contains(&last),
+            "应收敛到稳定速率，实际 {last}"
+        );
+    }
+
+    #[test]
+    fn speed_meter_samples_cumulative_bytes() {
+        let mut m = SpeedMeter::new(0.5);
+        // 第一次采样没有基准，返回 0
+        assert_eq!(m.sample(0), 0);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let v = m.sample(120_000);
+        assert!(v > 0, "第二次采样应给出速度：{v}");
+    }
 
     #[test]
     fn decodes_trailing_escape() {

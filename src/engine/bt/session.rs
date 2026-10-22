@@ -103,6 +103,10 @@ struct PeerState {
     choking: bool,
     /// 已发出但未收回的块数
     outstanding: u32,
+    /// 已向该 peer 发出、尚未收到数据的块。
+    /// 断线时必须把它们放回待下载池，否则这些块永远停在 `pending` 里，
+    /// 所在分片就永远凑不齐 —— 表现是"数据在动但分片数一直不涨"。
+    requested: Vec<BlockId>,
 }
 
 type OwnedWriteHalf = tokio::net::tcp::OwnedWriteHalf;
@@ -111,7 +115,10 @@ type OwnedReadHalf = tokio::net::tcp::OwnedReadHalf;
 /// 运行期统计，回传给 UI。
 #[derive(Debug, Clone, Default)]
 pub struct BtStats {
+    /// 已校验通过的分片总字节数
     pub downloaded: u64,
+    /// 种子总大小（界面进度条要用它算百分比，否则 downloaded/自身 永远 100%）
+    pub total: u64,
     pub uploaded: u64,
     pub peers: usize,
     pub seeds: usize,
@@ -156,7 +163,9 @@ impl Default for BtOptions {
             port: 6881,
             max_peers: 50,
             seed_after_complete: true,
-            max_inflight_per_peer: 8,
+            // 每 peer 的流水线深度：8 块(128KB) 在高延迟链路上撑不满带宽，
+            // 32 块(512KB) 是主流客户端的常见取值
+            max_inflight_per_peer: 32,
         }
     }
 }
@@ -208,6 +217,8 @@ pub struct BtSession {
     bucket: Arc<TokenBucket>,
     stats: Arc<Mutex<BtStats>>,
     dl_bytes: Arc<AtomicU64>,
+    /// 下载速度平滑器（界面上的速度是缓升缓降的曲线，不是锯齿）
+    speed_meter: std::sync::Mutex<crate::common::util::SpeedMeter>,
 }
 
 impl BtSession {
@@ -226,6 +237,7 @@ impl BtSession {
             bucket,
             stats: Arc::new(Mutex::new(BtStats::default())),
             dl_bytes: Arc::new(AtomicU64::new(0)),
+            speed_meter: std::sync::Mutex::new(crate::common::util::SpeedMeter::default()),
         }
     }
 
@@ -241,17 +253,22 @@ impl BtSession {
         self.handle.cancel.load(Ordering::Relaxed)
     }
 
-    /// 预分配磁盘空间。
-    async fn allocate_files(&self, msg: &Msg) -> Result<()> {
+    /// 预分配磁盘空间。返回 `true` 表示至少有一个文件是**已存在且大小正确**的
+    /// （只有这种情况才值得跑一遍 SHA1 校验；全新创建的文件必然是空的）。
+    async fn allocate_files(&self, msg: &Msg) -> Result<bool> {
+        let mut any_existing = false;
         for f in &self.meta.files {
             let full = self.file_path_for(f);
             if let Some(dir) = full.parent() {
                 tokio::fs::create_dir_all(dir).await.ok();
             }
-            let need = match tokio::fs::metadata(&full).await {
-                Ok(md) => md.len() != f.length,
-                Err(_) => true,
+            let (need, existed) = match tokio::fs::metadata(&full).await {
+                Ok(md) => (md.len() != f.length, md.len() == f.length && md.len() > 0),
+                Err(_) => (true, false),
             };
+            if existed {
+                any_existing = true;
+            }
             if need {
                 let file = tokio::fs::OpenOptions::new()
                     .create(true)
@@ -267,7 +284,7 @@ impl BtSession {
             self.meta.files.len(),
             crate::common::util::human_size(self.meta.total_length)
         ));
-        Ok(())
+        Ok(any_existing)
     }
 
     /// 校验本地已有数据，返回已完成的分片集合。
@@ -416,15 +433,23 @@ impl BtSession {
         on_progress: Arc<dyn Fn(BtStats) + Send + Sync>,
     ) -> Result<()> {
         tokio::fs::create_dir_all(&self.save_path).await.ok();
-        self.allocate_files(&msg).await?;
+        let had_data = self.allocate_files(&msg).await?;
 
-        let existing = self.verify_existing(msg.clone()).await?;
+        // 全新创建的文件一定是空的，没必要花几十秒把 4.7 GB 零读一遍做 SHA1。
+        // 只有"文件已存在且大小对得上"（上次下到一半）时才需要校验。
+        let existing = if had_data {
+            self.verify_existing(msg.clone()).await?
+        } else {
+            msg("新建文件，跳过已有数据校验".into());
+            HashSet::new()
+        };
         let piece_count = self.meta.piece_count();
         if existing.len() == piece_count && piece_count > 0 {
             msg("本地数据已完整，无需下载".into());
             {
                 let mut s = self.stats.lock().unwrap();
                 s.downloaded = self.meta.total_length;
+                s.total = self.meta.total_length;
                 s.pieces_done = piece_count;
                 s.pieces_total = piece_count;
             }
@@ -448,6 +473,7 @@ impl BtSession {
 
         {
             let mut s = self.stats.lock().unwrap();
+            s.total = self.meta.total_length;
             s.downloaded = self.bytes_of_completed(&state);
             s.pieces_done = state.completed.len();
             s.pieces_total = piece_count;
@@ -465,6 +491,14 @@ impl BtSession {
         } else {
             merge_trackers(&own)
         };
+        // 在线 peer 数（tracker_loop 用它判断要不要走 DHT 补人）
+        let live_peers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let own_n = super::metainfo::trackers_of(&self.meta).len();
+        msg(format!(
+            "开始向 {} 个 tracker 公告（种子自带 {own_n} 个{}）",
+            trackers.len(),
+            if self.meta.is_private { "，私有种子" } else { "" }
+        ));
         let tracker_task = tokio::spawn(tracker_loop(
             trackers,
             self.meta.info_hash,
@@ -472,6 +506,7 @@ impl BtSession {
             self.opts.max_peers,
             self.meta.total_length,
             self.stats.clone(),
+            live_peers.clone(),
             addr_tx.clone(),
             msg.clone(),
         ));
@@ -479,7 +514,13 @@ impl BtSession {
         let peers: Arc<Mutex<Vec<PeerState>>> = Arc::new(Mutex::new(Vec::new()));
         let mut peer_counts = PeerCounts::default();
         let mut last_report = std::time::Instant::now();
-        let mut last_dl = self.bytes_of_completed(&state);
+        let mut last_dl = self.dl_bytes.load(Ordering::Relaxed);
+        // 是否真的补齐了全部分片（只有它为 true 才能对外报"完成"）
+        let mut all_done = false;
+        // 最近一次真正收到数据的时刻（用于回收"假活 peer"占着的块）
+        let mut last_data = std::time::Instant::now();
+        // 连接失败计数（诊断用：解释"为什么只有几个 peer"）
+        let mut peer_fails = 0usize;
 
         loop {
             if self.cancelled() {
@@ -494,6 +535,7 @@ impl BtSession {
 
             // ---- 连接新 peer ----
             let live = peers.lock().unwrap().len();
+            live_peers.store(live, Ordering::Relaxed);
             if live < self.opts.max_peers {
                 let mut budget = self.opts.max_peers - live;
                 while budget > 0 {
@@ -539,12 +581,13 @@ impl BtSession {
                                     bitfield: None,
                                     choking: true,
                                     outstanding: 0,
+                                    requested: Vec::new(),
                                 });
                                 let _ = ev_tx.send(BtEvent::PeerAdded(addr));
                                 spawn_peer_reader(addr, r, ev_tx);
                             }
-                            Err(_) => {
-                                let _ = ev_tx.send(BtEvent::PeerFailed(addr));
+                            Err(e) => {
+                                let _ = ev_tx.send(BtEvent::PeerFailed(addr, e.to_string()));
                             }
                         }
                     });
@@ -556,8 +599,20 @@ impl BtSession {
             while let Ok(ev) = ev_rx.try_recv() {
                 match ev {
                     BtEvent::PeerAdded(_) => {}
-                    BtEvent::PeerFailed(_) => {}
+                    BtEvent::PeerFailed(addr, why) => {
+                        // 连不上的 peer 也可能已占着块（握手后立刻断开），一并回收
+                        release_peer_blocks(&peers, &mut state, addr);
+                        peer_fails += 1;
+                        // 每隔一段打一条汇总，便于判断"为什么 peer 这么少"
+                        if peer_fails % 20 == 0 {
+                            msg(format!(
+                                "连接失败 {peer_fails} 次（最近一次 {addr}：{why}）"
+                            ));
+                        }
+                        dirty = true;
+                    }
                     BtEvent::Disconnected(addr) => {
+                        release_peer_blocks(&peers, &mut state, addr);
                         let mut list = peers.lock().unwrap();
                         if let Some(pos) = list.iter().position(|p| p.addr == addr) {
                             list.remove(pos);
@@ -593,10 +648,14 @@ impl BtSession {
                         data,
                     } => {
                         dirty = true;
+                        last_data = std::time::Instant::now();
                         if let Some(p) = peers.lock().unwrap().iter_mut().find(|p| p.addr == addr) {
                             if p.outstanding > 0 {
                                 p.outstanding -= 1;
                             }
+                            let bi = begin / BLOCK_LEN;
+                            p.requested
+                                .retain(|b| !(b.piece == piece && b.index == bi));
                         }
                         let block_index = begin / BLOCK_LEN;
                         let id = BlockId {
@@ -651,6 +710,33 @@ impl BtSession {
                 }
             }
 
+            // ---- 兜底：回收"没人认领"的在途块 ----
+            // 除了断线回收，还有一种情况：peer 连着但一直不回包（假活），
+            // 它领走的块同样卡死。超过 15s 没收到任何数据就把无主的块放回池子。
+            if last_data.elapsed() > Duration::from_secs(15) {
+                let claimed: HashSet<BlockId> = peers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|p| p.requested.iter().copied())
+                    .collect();
+                let orphan: Vec<BlockId> = state
+                    .pending
+                    .iter()
+                    .filter(|b| !claimed.contains(*b))
+                    .copied()
+                    .collect();
+                if !orphan.is_empty() {
+                    for b in &orphan {
+                        state.pending.remove(b);
+                    }
+                    for p in peers.lock().unwrap().iter_mut() {
+                        p.outstanding = 0;
+                    }
+                }
+                last_data = std::time::Instant::now();
+            }
+
             // ---- 选块并发出请求 ----
             {
                 let avail = {
@@ -670,13 +756,23 @@ impl BtSession {
                 peer_counts.seeds = avail_count.get(&0).copied().unwrap_or(0);
                 peer_counts.leeches = avail.len().saturating_sub(peer_counts.seeds as usize);
 
+                // 所有 peer 的流水线都满了就别选块了：select_blocks 需要遍历并排序
+                // 全部分片，19000 分片的种子下每 5ms 排一次会吃掉一整核 CPU，
+                // 直接把下载拖慢一个数量级。
+                let has_capacity = peers.lock().unwrap().iter().any(|p| {
+                    !p.choking && p.outstanding < self.opts.max_inflight_per_peer
+                });
                 let total_inflight = self.opts.max_inflight_per_peer as usize * self.opts.max_peers;
-                let picks = select_blocks(
-                    &state,
-                    &self.meta,
-                    &avail_count,
-                    total_inflight.min(512) as u32,
-                );
+                let picks = if has_capacity {
+                    select_blocks(
+                        &state,
+                        &self.meta,
+                        &avail_count,
+                        total_inflight.min(512) as u32,
+                    )
+                } else {
+                    Vec::new()
+                };
 
                 if !picks.is_empty() {
                     // 规划阶段（持锁） + 发送阶段（不持锁）。
@@ -721,6 +817,7 @@ impl BtSession {
                     }
 
                     let mut failed: Option<usize> = None;
+                    let mut sent: Vec<(usize, BlockId)> = Vec::new();
                     for (idx, block, len) in plan {
                         let Some(w) = taken.get_mut(&idx) else { break };
                         let mut tmp = PeerConnection {
@@ -744,6 +841,7 @@ impl BtSession {
                             break;
                         }
                         state.pending.insert(block);
+                        sent.push((idx, block));
                     }
 
                     // 统一把写侧放回，并回滚失败 peer 的在途计数
@@ -752,6 +850,12 @@ impl BtSession {
                         for (idx, w) in taken {
                             if let Some(p) = list.get_mut(idx) {
                                 p.write = Some(w);
+                            }
+                        }
+                        // 记下"谁领了哪个块"，断线时才能把它们放回池子
+                        for (idx, block) in sent {
+                            if let Some(p) = list.get_mut(idx) {
+                                p.requested.push(block);
                             }
                         }
                         if let Some(idx) = failed {
@@ -766,10 +870,18 @@ impl BtSession {
             // ---- 更新统计 ----
             if last_report.elapsed() >= Duration::from_millis(500) {
                 let now_bytes = self.bytes_of_completed(&state);
+                // 速度用**块级**计数算：分片级（256KB 一个）在慢速种子上
+                // 十几秒才动一次，界面会一直是 0 B/s
+                let now_dl = self.dl_bytes.load(Ordering::Relaxed);
                 let dt = last_report.elapsed().as_secs_f64().max(0.001);
-                let speed = now_bytes.saturating_sub(last_dl) as f64 / dt;
+                // 瞬时速度先做 EWMA 平滑，否则界面上的速度会 0/峰值来回跳
+                let instant = now_dl.saturating_sub(last_dl) as f64 / dt;
+                let speed = self
+                    .speed_meter
+                    .lock()
+                    .unwrap()
+                    .smooth(instant) as f64;
                 let done = state.completed.len();
-                let plen = self.meta.piece_length as f64;
                 let mut s = self.stats.lock().unwrap();
                 s.downloaded = now_bytes;
                 s.speed_down = speed as u64;
@@ -779,14 +891,14 @@ impl BtSession {
                 s.seeds = peer_counts.seeds as usize;
                 s.leeches = peer_counts.leeches;
                 s.uploaded = 0;
-                let _ = plen;
                 drop(s);
-                last_dl = now_bytes;
+                last_dl = now_dl;
                 last_report = std::time::Instant::now();
                 on_progress(self.stats.lock().unwrap().clone());
             }
 
             if state.completed.len() >= piece_count {
+                all_done = true;
                 break;
             }
 
@@ -800,12 +912,39 @@ impl BtSession {
 
         tracker_task.abort();
 
+        // 只有真正补齐全部分片才对外报"完成"。
+        // 之前这里是**无条件**把 downloaded/pieces_done 写成 100%，
+        // 于是取消/中止（甚至是校验阶段被打断）的任务在界面上显示"已完成"，
+        // 实际文件却是半截的。
+        if !all_done {
+            let done = state.completed.len();
+            {
+                let mut s = self.stats.lock().unwrap();
+                s.total = self.meta.total_length;
+                s.downloaded = self.bytes_of_completed(&state);
+                s.pieces_done = done;
+                s.pieces_total = piece_count;
+                s.speed_down = 0;
+                s.speed_up = 0;
+            }
+            on_progress(self.stats.lock().unwrap().clone());
+            bail!(
+                "下载未完成：已校验 {done}/{piece_count} 个分片（{} / {}），任务已中止",
+                crate::common::util::human_size(self.bytes_of_completed(&state)),
+                crate::common::util::human_size(self.meta.total_length)
+            );
+        }
+
         {
             let mut s = self.stats.lock().unwrap();
             s.downloaded = self.meta.total_length;
+            s.total = self.meta.total_length;
             s.pieces_done = piece_count;
+            s.pieces_total = piece_count;
             s.speed_down = 0;
+            s.speed_up = 0;
         }
+        on_progress(self.stats.lock().unwrap().clone());
         Ok(())
     }
 }
@@ -820,7 +959,7 @@ struct PeerCounts {
 /// peer 读取任务把消息转成事件。
 enum BtEvent {
     PeerAdded(SocketAddr),
-    PeerFailed(SocketAddr),
+    PeerFailed(SocketAddr, String),
     Disconnected(SocketAddr),
     Choking(SocketAddr, bool),
     Have(SocketAddr, u32),
@@ -917,6 +1056,7 @@ async fn tracker_loop(
     numwant: usize,
     total_size: u64,
     stats: Arc<Mutex<BtStats>>,
+    live_peers: Arc<std::sync::atomic::AtomicUsize>,
     addr_tx: mpsc::UnboundedSender<SocketAddr>,
     msg: Msg,
 ) {
@@ -1002,8 +1142,17 @@ async fn tracker_loop(
             }
         }
 
-        if !got_any {
-            // 所有 tracker 都没给 peer，转到 DHT 找（只在首次失败时初始化）
+        // 公网 swarm 里大量 peer 是不可直连的（NAT/已下线），tracker 给的地址
+        // 往往只能连上很小一部分。只要在线 peer 数不到目标的一半，就用 DHT 补充来源。
+        let live = live_peers.load(Ordering::Relaxed);
+        let need_more = live * 2 < numwant;
+        if !got_any || need_more {
+            if !got_any {
+                msg("所有 tracker 都没给出 peer，转到 DHT 网络查找".to_string());
+            } else {
+                msg(format!("在线 peer 只有 {live} 个，向 DHT 补充查找"));
+            }
+            // DHT 懒初始化（只在需要时启动）
             if dht.is_none() {
                 match dht::Dht::start(port).await {
                     Ok(node) => {
@@ -1016,7 +1165,7 @@ async fn tracker_loop(
                 }
             }
             if let Some(node) = &dht {
-                let found = node.get_peers(info_hash, Duration::from_secs(25)).await;
+                let found = node.get_peers(info_hash, Duration::from_secs(20)).await;
                 msg(format!("DHT 返回 {} 个 peer", found.len()));
                 for p in found {
                     if p.port() > 0 {
@@ -1065,6 +1214,25 @@ pub(crate) fn map_span(files: &[TorrentFile], from: u64, to: u64) -> Vec<(usize,
         }
     }
     out
+}
+
+/// 把某个 peer 尚未回包的块放回待下载池。
+///
+/// 不做这件事的话：peer 断线时它领走的块会永远留在 `state.pending` 里，
+/// 既不会被重新请求，也不会被标记为已收到 —— 所在分片就永远凑不齐。
+/// 表现出来就是"速率一直很低、分片数几十分钟不涨"。
+fn release_peer_blocks(
+    peers: &Arc<Mutex<Vec<PeerState>>>,
+    state: &mut PieceState,
+    addr: SocketAddr,
+) {
+    let mut list = peers.lock().unwrap();
+    if let Some(p) = list.iter_mut().find(|p| p.addr == addr) {
+        for b in p.requested.drain(..) {
+            state.pending.remove(&b);
+        }
+        p.outstanding = 0;
+    }
 }
 
 /// rarest-first 选块：稀有分片优先，同稀有度按序号推进。

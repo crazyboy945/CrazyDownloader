@@ -19,6 +19,7 @@ use anyhow::Result;
 use tokio::runtime::Runtime;
 
 use crate::common::limits::TokenBucket;
+use crate::common::util::SpeedMeter;
 use crate::common::task::{
     estimate_eta, Config, LogBuffer, LogLevel, Source, Task, TaskId, TaskState,
 };
@@ -31,6 +32,8 @@ pub struct TaskControl {
     last_downloaded: AtomicU64,
     last_uploaded: AtomicU64,
     last_tick: Mutex<std::time::Instant>,
+    /// 下载/上传速度平滑器（避免界面速度忽高忽低）
+    meters: Mutex<(SpeedMeter, SpeedMeter)>,
 }
 
 impl Default for TaskControl {
@@ -41,12 +44,13 @@ impl Default for TaskControl {
             last_downloaded: AtomicU64::new(0),
             last_uploaded: AtomicU64::new(0),
             last_tick: Mutex::new(std::time::Instant::now()),
+            meters: Mutex::new((SpeedMeter::default(), SpeedMeter::default())),
         }
     }
 }
 
 impl TaskControl {
-    /// 基于上一次的采样计算瞬时速度（字节/秒）。
+    /// 基于上一次的采样计算速度（字节/秒），结果经过 EWMA 平滑。
     pub fn compute_speed(&self, downloaded: u64, uploaded: u64) -> (u64, u64) {
         let mut last = self.last_tick.lock().unwrap();
         let now = std::time::Instant::now();
@@ -61,7 +65,11 @@ impl TaskControl {
         let up = uploaded.saturating_sub(ul) as f64 / dt;
         self.last_downloaded.store(downloaded, Ordering::Relaxed);
         self.last_uploaded.store(uploaded, Ordering::Relaxed);
-        (down as u64, up as u64)
+        drop(last);
+        let mut meters = self.meters.lock().unwrap();
+        let d = meters.0.smooth(down);
+        let u = meters.1.smooth(up);
+        (d, u)
     }
 }
 
@@ -587,8 +595,15 @@ async fn run_bt(
             t.leeches = s.leeches;
             t.pieces_done = s.pieces_done;
             t.pieces_total = s.pieces_total;
-            t.total_bytes = t.total_bytes.max(s.downloaded);
-            if t.state == TaskState::Connecting && t.total_bytes > 0 {
+            // 用种子的真实总大小，不要用 max(downloaded)
+            // （那样 downloaded/total 恒等于 100%，进度条一开始就是满的）
+            if s.total > 0 {
+                t.total_bytes = s.total;
+            } else {
+                t.total_bytes = t.total_bytes.max(s.downloaded);
+            }
+            t.speed_down = s.speed_down;
+            if matches!(t.state, TaskState::Connecting | TaskState::Paused) && s.pieces_total > 0 {
                 t.state = TaskState::Downloading;
             }
         }
@@ -608,10 +623,27 @@ async fn run_bt(
 
     bt::session::run_task(&link, &target, opts, handle, bucket, msg, on_progress).await?;
 
+    // 再核一遍：会话返回 Ok 也必须真的"分片全齐"才算完成。
+    // 之前这里无条件标 Completed，一旦中途退出就会谎报已完成。
+    let (done, total, bytes, size) = {
+        let t = task.lock().unwrap();
+        (t.pieces_done, t.pieces_total, t.downloaded, t.total_bytes)
+    };
+    if total == 0 || done < total || bytes < size {
+        anyhow::bail!(
+            "下载未完成：{done}/{total} 个分片，{}/{}",
+            crate::common::util::human_size(bytes),
+            crate::common::util::human_size(size)
+        );
+    }
+
     {
         let mut t = task.lock().unwrap();
         t.state = TaskState::Completed;
+        // 分片全齐即等于总大小（最后一片按实际长度计），这里再对齐一次
+        t.downloaded = t.downloaded.max(size);
         t.speed_down = 0;
+        t.speed_up = 0;
         t.eta = None;
         t.last_message = "下载完成".into();
     }
@@ -641,10 +673,14 @@ pub fn spawn_ticker(engine: Arc<Mutex<EngineState>>) {
             };
             for (t, c) in snapshot {
                 if let (Ok(mut task), Some(ctl)) = (t.lock(), c) {
-                    let (down, up) = ctl.compute_speed(task.downloaded, task.uploaded);
-                    task.speed_down = down;
-                    task.speed_up = up;
-                    task.eta = estimate_eta(task.downloaded, task.total_bytes, down);
+                    // BT 的速度由会话按**块**级采样后自己上报（分片级差分在慢速种子上
+                    // 十几秒才动一次，界面会一直显示 0 B/s），这里不要覆盖它。
+                    if task.pieces_total == 0 {
+                        let (down, up) = ctl.compute_speed(task.downloaded, task.uploaded);
+                        task.speed_down = down;
+                        task.speed_up = up;
+                    }
+                    task.eta = estimate_eta(task.downloaded, task.total_bytes, task.speed_down);
                 }
             }
         }
